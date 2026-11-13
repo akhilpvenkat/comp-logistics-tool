@@ -1,76 +1,57 @@
 import sys
+import numpy as np
+from scipy.optimize import linprog
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from stage1_scorer import load_data, score
+from stage1_scorer import load_data
 
 
-def greedy(D):
+def lp_upper_bound(D):
     S, P, Dd, M, K = D["suppliers"], D["procs"], D["dists"], D["mats"], D["prods"]
-    sol = {"supply": {}, "ship_sp": {}, "make": {}, "send": {}}
-    supply_left = dict(D["s_max"])
-    hours_left = dict(D["p_cap"])
-    demand_left = dict(D["d_demand"])
+    idx, cost, ub = {}, [], []
 
-    def cheapest_material_cost(p, k):
-        total = 0.0
-        for m in M:
-            q = D["req"][(k, m)]
-            if q == 0:
-                continue
-            best = min(D["s_cost"][(s, m)] + D["mat_ship"][m] * D["dist"][(s, p)] for s in S)
-            total += q * best
-        return total
+    def add(key, c, u):
+        idx[key] = len(cost)
+        cost.append(c)
+        ub.append(u)
 
-    routes = []
+    for s in S:
+        for p in P:
+            for m in M:
+                add(("ms", s, p, m), D["s_cost"][(s, m)] + D["mat_ship"][m] * D["dist"][(s, p)], D["s_max"][(s, m)])
     for p in P:
         for k in K:
-            for d in Dd:
-                margin = (D["d_price"][(d, k)]
-                          - D["mat_ship"][k] * D["dist"][(p, d)]
-                          - D["p_time"][(p, k)] * D["p_rate"][p]
-                          - cheapest_material_cost(p, k))
-                per_hour = margin / D["p_time"][(p, k)]
-                routes.append((per_hour, margin, p, k, d))
-    routes.sort(reverse=True)
+            add(("mk", p, k), D["p_time"][(p, k)] * D["p_rate"][p], D["p_cap"][p] / D["p_time"][(p, k)])
+    for p in P:
+        for d in Dd:
+            for k in K:
+                add(("sd", p, d, k), D["mat_ship"][k] * D["dist"][(p, d)] - D["d_price"][(d, k)], D["d_demand"][(d, k)])
 
-    for per_hour, margin, p, k, d in routes:
-        if margin <= 0:
-            continue
-        n = min(int(hours_left[p] // D["p_time"][(p, k)]), int(demand_left[(d, k)]))
-        while n > 0:
-            plan = {}
-            ok = True
-            for m in M:
-                need = n * D["req"][(k, m)]
-                for s in sorted(S, key=lambda s: D["s_cost"][(s, m)] + D["mat_ship"][m] * D["dist"][(s, p)]):
-                    take = min(need, supply_left[(s, m)])
-                    if take > 0:
-                        plan[(s, m)] = take
-                        need -= take
-                    if need <= 1e-9:
-                        break
-                if need > 1e-9:
-                    ok = False
-                    break
-            if ok:
-                break
-            n -= 1
-        if n <= 0:
-            continue
-        for (s, m), q in plan.items():
-            q = round(q + 0.049999, 1)
-            supply_left[(s, m)] -= q
-            sol["supply"][(s, m)] = round(sol["supply"].get((s, m), 0) + q, 1)
-            sol["ship_sp"][(s, p, m)] = round(sol["ship_sp"].get((s, p, m), 0) + q, 1)
-        hours_left[p] -= n * D["p_time"][(p, k)]
-        demand_left[(d, k)] -= n
-        sol["make"][(p, k)] = sol["make"].get((p, k), 0) + n
-        sol["send"][(p, d, k)] = sol["send"].get((p, d, k), 0) + n
-    return sol
+    A, b = [], []
+
+    def le(coefs, rhs):
+        row = np.zeros(len(cost))
+        for key, v in coefs:
+            row[idx[key]] = v
+        A.append(row)
+        b.append(rhs)
+
+    for s in S:
+        for m in M:
+            le([(("ms", s, p, m), 1) for p in P], D["s_max"][(s, m)])
+    for p in P:
+        for m in M:
+            le([(("ms", s, p, m), -1) for s in S] + [(("mk", p, k), D["req"][(k, m)]) for k in K], 0)
+        le([(("mk", p, k), D["p_time"][(p, k)]) for k in K], D["p_cap"][p])
+        for k in K:
+            le([(("sd", p, d, k), 1) for d in Dd] + [(("mk", p, k), -1)], 0)
+    for d in Dd:
+        for k in K:
+            le([(("sd", p, d, k), 1) for p in P], D["d_demand"][(d, k)])
+
+    res = linprog(cost, A_ub=np.array(A), b_ub=np.array(b), bounds=list(zip([0] * len(cost), ub)), method="highs")
+    return -res.fun
 
 
 if __name__ == "__main__":
     data = load_data(sys.argv[1])
-    solution = greedy(data)
-    profit, problems = score(data, solution)
-    print(f"greedy profit = ${profit:,.2f}")
-    print("violations:", problems or "none")
+    print(f"LP relaxation upper bound = ${lp_upper_bound(data):,.2f}")
